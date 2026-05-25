@@ -498,6 +498,47 @@ class CreatePagesDeploymentInput(_CFBase):
     branch: Optional[str] = Field(default=None, description="Branch to deploy (defaults to the production branch)")
 
 
+# Cloudflare Registrar (account-scoped — needs Account -> Domain/Registrar permission)
+class ListDomainsInput(_CFBase):
+    """Input for listing the registrar domains held by the account."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
+
+
+class GetDomainInput(_CFBase):
+    """Input for getting one registrar domain's details."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    domain_name: str = Field(..., description="Fully qualified domain name, e.g. 'example.com'", min_length=1, max_length=253)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
+
+
+class CheckDomainAvailabilityInput(_CFBase):
+    """Input for checking domain availability against the registries (read-only)."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    domains: List[str] = Field(
+        ...,
+        description="One or more FQDNs to check, e.g. ['example.com', 'mybrand.app'].",
+        min_length=1,
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
+
+
+class UpdateDomainInput(_CFBase):
+    """Input for updating registrar domain settings (only provided fields change)."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    domain_name: str = Field(..., description="FQDN to update, e.g. 'example.com'", min_length=1, max_length=253)
+    auto_renew: Optional[bool] = Field(
+        default=None,
+        description="Enable/disable auto-renew. True authorizes Cloudflare to charge the account's default payment method ~30 days before expiry."
+    )
+    locked: Optional[bool] = Field(default=None, description="Registrar transfer lock on/off.")
+    privacy: Optional[bool] = Field(default=None, description="WHOIS privacy (redaction) on/off.")
+
+
 # Shared utilities
 def _is_openbao_agent_available() -> bool:
     """Check if OpenBao agent is reachable."""
@@ -558,7 +599,7 @@ def _get_api_token() -> str:
         "Cloudflare API token not found.\n"
         f"Configure {CF_ACCOUNTS_FILE} (multi-account) or set CLOUDFLARE_API_TOKEN.\n\n"
         "Create API token at: https://dash.cloudflare.com/profile/api-tokens\n"
-        "Required permissions: Zone:Read, DNS:Edit, Dynamic Redirect:Edit, Cloudflare Pages:Edit"
+        "Required permissions: Zone:Read, DNS:Edit, Dynamic Redirect:Edit, Cloudflare Pages:Edit, Domain/Registrar (read+edit)"
     )
 
 
@@ -1405,6 +1446,151 @@ async def cloudflare_create_pages_deployment(params: CreatePagesDeploymentInput)
         )
         d = data.get("result", {}) or {}
         return f"Deployment triggered for '{params.project_name}':\n\n{_format_pages_deployment_markdown(d)}"
+    except Exception as e:
+        return _handle_error(e)
+
+
+# =============================================================================
+# Cloudflare Registrar (domains)
+# =============================================================================
+
+
+def _format_domain_markdown(d: dict) -> str:
+    """Format a registrar domain as markdown (defensive — fields vary by API gen)."""
+    name = d.get("name") or d.get("domain_name") or "?"
+    lines = [f"### {name}"]
+    expires = d.get("expires_at") or d.get("registry_expires_at")
+    if expires:
+        lines.append(f"- **Expires**: {expires}")
+    if "auto_renew" in d:
+        lines.append(f"- **Auto-renew**: {'Yes' if d.get('auto_renew') else 'No'}")
+    if "locked" in d:
+        lines.append(f"- **Transfer lock**: {'Yes' if d.get('locked') else 'No'}")
+    if "privacy" in d or "privacy_mode" in d:
+        priv = d.get("privacy")
+        if priv is None:
+            priv = d.get("privacy_mode") == "redaction"
+        lines.append(f"- **WHOIS privacy**: {'Yes' if priv else 'No'}")
+    if d.get("current_registrar"):
+        lines.append(f"- **Registrar**: {d.get('current_registrar')}")
+    statuses = d.get("registry_statuses") or d.get("status")
+    if statuses:
+        lines.append(f"- **Status**: {statuses if isinstance(statuses, str) else ', '.join(statuses)}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="cloudflare_list_domains",
+    annotations={"title": "List Registrar Domains", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_list_domains(params: ListDomainsInput) -> str:
+    """List the domains in this account's Cloudflare Registrar.
+
+    Portfolio overview — each domain's expiry, auto-renew, transfer lock, WHOIS
+    privacy, and registry status. Requires the token to have Account -> Domain/
+    Registrar (read).
+    """
+    try:
+        account_id = await _resolve_account_id()
+        data = await _make_request("GET", f"accounts/{account_id}/registrar/domains")
+        domains = data.get("result", []) or []
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({"account_id": account_id, "domains": domains}, indent=2)
+        if not domains:
+            return "No registrar domains in this account."
+        lines = ["# Cloudflare Registrar Domains", "", f"{len(domains)} domain(s)", ""]
+        for d in domains:
+            lines.append(_format_domain_markdown(d))
+            lines.append("")
+        result = "\n".join(lines)
+        if len(result) > CHARACTER_LIMIT:
+            result = result[:CHARACTER_LIMIT] + "\n\n**[Output truncated.]**"
+        return result
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_get_domain",
+    annotations={"title": "Get Registrar Domain", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_get_domain(params: GetDomainInput) -> str:
+    """Get one registrar domain's details (expiry, auto-renew, lock, privacy, status)."""
+    try:
+        account_id = await _resolve_account_id()
+        data = await _make_request("GET", f"accounts/{account_id}/registrar/domains/{params.domain_name}")
+        d = data.get("result", {}) or {}
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(d, indent=2)
+        return _format_domain_markdown(d)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_check_domain_availability",
+    annotations={"title": "Check Domain Availability", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_check_domain_availability(params: CheckDomainAvailabilityInput) -> str:
+    """Check whether one or more domains are available to register.
+
+    Live, authoritative check against the registries (read-only — does not
+    register anything). Use before any registration in the dashboard.
+    """
+    try:
+        account_id = await _resolve_account_id()
+        data = await _make_request(
+            "POST", f"accounts/{account_id}/registrar/domain-check", json_data={"domains": params.domains}
+        )
+        result = data.get("result", []) or []
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({"account_id": account_id, "result": result}, indent=2)
+        items = result if isinstance(result, list) else [result]
+        lines = ["# Domain Availability", ""]
+        for it in items:
+            if not isinstance(it, dict):
+                lines.append(f"- {it}")
+                continue
+            name = it.get("domain_name") or it.get("name") or "?"
+            bits = []
+            if it.get("available") is not None:
+                bits.append("available" if it.get("available") else "taken")
+            if it.get("can_register") is not None:
+                bits.append("registrable here" if it.get("can_register") else "not registrable here")
+            if it.get("price"):
+                bits.append(f"price {it.get('price')}")
+            lines.append(f"- **{name}**: {', '.join(bits) if bits else json.dumps(it)}")
+        return "\n".join(lines)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_update_domain",
+    annotations={"title": "Update Registrar Domain", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_update_domain(params: UpdateDomainInput) -> str:
+    """Update registrar settings for a domain: auto_renew, locked (transfer lock),
+    and privacy (WHOIS redaction). Only the fields you pass change. Safe and
+    reversible — does NOT register, transfer, or delete anything.
+    """
+    try:
+        body = {}
+        if params.auto_renew is not None:
+            body["auto_renew"] = params.auto_renew
+        if params.locked is not None:
+            body["locked"] = params.locked
+        if params.privacy is not None:
+            body["privacy"] = params.privacy
+        if not body:
+            return "Error: provide at least one of auto_renew, locked, privacy."
+        account_id = await _resolve_account_id()
+        data = await _make_request(
+            "PUT", f"accounts/{account_id}/registrar/domains/{params.domain_name}", json_data=body
+        )
+        d = data.get("result", {}) or {}
+        detail = _format_domain_markdown(d) if d else f"Applied: {json.dumps(body)}"
+        return f"Domain '{params.domain_name}' updated:\n\n{detail}"
     except Exception as e:
         return _handle_error(e)
 
