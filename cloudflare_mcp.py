@@ -23,8 +23,9 @@ import json
 from typing import Optional, List, Literal
 from enum import Enum
 
+import contextvars
 import httpx
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from mcp.server.fastmcp import FastMCP
 
 # OpenBao Agent Configuration
@@ -151,8 +152,71 @@ class DNSRecordType(str, Enum):
     PTR = "PTR"
 
 
+# =============================================================================
+# Multi-account ("cloudflare rich")
+# =============================================================================
+# Per-account API tokens live in ~/.mcp-credentials/cloudflare-accounts.json:
+#   { "jumbo": "<token>", "ets": "<token>" }
+# Read at call time (mtime-cached) so a NEW account hot-swaps in with no restart.
+# Every tool inherits `account` (default CLOUDFLARE_DEFAULT_ACCOUNT or 'jumbo');
+# a model validator binds it to a ContextVar that _get_api_token() reads. Falls
+# back to CLOUDFLARE_API_TOKEN / OpenBao when no accounts file exists.
+CF_ACCOUNTS_FILE = os.getenv(
+    "CLOUDFLARE_ACCOUNTS_FILE", os.path.expanduser("~/.mcp-credentials/cloudflare-accounts.json")
+)
+CF_DEFAULT_ACCOUNT = os.getenv("CLOUDFLARE_DEFAULT_ACCOUNT", "jumbo")
+_current_account = contextvars.ContextVar("cf_account", default=None)
+_cf_accounts_cache = {"data": None, "mtime": -1.0}
+
+
+def _load_cf_accounts() -> dict:
+    """Load {label: token} from the accounts file (mtime-cached for hot-swap)."""
+    try:
+        st = os.stat(CF_ACCOUNTS_FILE)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return _cf_accounts_cache["data"] or {}
+    if _cf_accounts_cache["data"] is None or st.st_mtime != _cf_accounts_cache["mtime"]:
+        try:
+            with open(CF_ACCOUNTS_FILE) as fh:
+                raw = json.load(fh)
+        except Exception:
+            return _cf_accounts_cache["data"] or {}
+        acc = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, str) and v:
+                    acc[k] = v
+                elif isinstance(v, dict) and v.get("token"):
+                    acc[k] = v["token"]
+        _cf_accounts_cache["data"] = acc
+        _cf_accounts_cache["mtime"] = st.st_mtime
+    return _cf_accounts_cache["data"] or {}
+
+
+class _CFBase(BaseModel):
+    """Base for all tool inputs — adds the multi-account `account` selector and
+    binds it to a ContextVar so the per-call token routing is transparent."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    account: Optional[str] = Field(
+        default=None,
+        description=(
+            "Which configured Cloudflare account/token to use (e.g. 'jumbo', 'ets'). "
+            "Configured in ~/.mcp-credentials/cloudflare-accounts.json; defaults to "
+            f"'{CF_DEFAULT_ACCOUNT}'. New accounts hot-swap in with no restart."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _bind_account(self):
+        _current_account.set(self.account)
+        return self
+
+
 # Pydantic Input Models
-class ListZonesInput(BaseModel):
+class ListZonesInput(_CFBase):
     """Input for listing Cloudflare zones."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -169,7 +233,7 @@ class ListZonesInput(BaseModel):
     )
 
 
-class GetZoneInput(BaseModel):
+class GetZoneInput(_CFBase):
     """Input for getting a specific zone."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -185,7 +249,7 @@ class GetZoneInput(BaseModel):
     )
 
 
-class ListDNSRecordsInput(BaseModel):
+class ListDNSRecordsInput(_CFBase):
     """Input for listing DNS records in a zone."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -211,7 +275,7 @@ class ListDNSRecordsInput(BaseModel):
     )
 
 
-class CreateDNSRecordInput(BaseModel):
+class CreateDNSRecordInput(_CFBase):
     """Input for creating a DNS record."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -272,7 +336,7 @@ class CreateDNSRecordInput(BaseModel):
         return v
 
 
-class UpdateDNSRecordInput(BaseModel):
+class UpdateDNSRecordInput(_CFBase):
     """Input for updating a DNS record."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -287,7 +351,7 @@ class UpdateDNSRecordInput(BaseModel):
     comment: Optional[str] = Field(default=None, description="New comment", max_length=500)
 
 
-class DeleteDNSRecordInput(BaseModel):
+class DeleteDNSRecordInput(_CFBase):
     """Input for deleting a DNS record."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -299,7 +363,7 @@ class DeleteDNSRecordInput(BaseModel):
 _REDIRECT_STATUS_CODES = (301, 302, 303, 307, 308)
 
 
-class ListRedirectRulesInput(BaseModel):
+class ListRedirectRulesInput(_CFBase):
     """Input for listing a zone's redirect (Single Redirect) rules."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -309,7 +373,7 @@ class ListRedirectRulesInput(BaseModel):
     )
 
 
-class CreateRedirectRuleInput(BaseModel):
+class CreateRedirectRuleInput(_CFBase):
     """Input for creating a redirect (Single Redirect) rule."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -348,7 +412,7 @@ class CreateRedirectRuleInput(BaseModel):
         return v
 
 
-class UpdateRedirectRuleInput(BaseModel):
+class UpdateRedirectRuleInput(_CFBase):
     """Input for updating a redirect rule by id (only provided fields change)."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -371,7 +435,7 @@ class UpdateRedirectRuleInput(BaseModel):
         return v
 
 
-class DeleteRedirectRuleInput(BaseModel):
+class DeleteRedirectRuleInput(_CFBase):
     """Input for deleting a redirect rule by id."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -380,26 +444,22 @@ class DeleteRedirectRuleInput(BaseModel):
 
 
 # Cloudflare Pages (account-scoped — needs Account -> Cloudflare Pages -> Edit)
-class ListPagesProjectsInput(BaseModel):
+class ListPagesProjectsInput(_CFBase):
     """Input for listing Pages projects."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    account: Optional[str] = Field(
-        default=None, description="Account name or ID (optional if the token sees exactly one account)"
-    )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
 
 
-class GetPagesProjectInput(BaseModel):
+class GetPagesProjectInput(_CFBase):
     """Input for getting one Pages project."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
     project_name: str = Field(..., description="Pages project name", min_length=1)
-    account: Optional[str] = Field(default=None, description="Account name or ID")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
 
 
-class CreatePagesProjectInput(BaseModel):
+class CreatePagesProjectInput(_CFBase):
     """Input for creating a Pages project (direct-upload, or git-connected to GitHub)."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -413,33 +473,29 @@ class CreatePagesProjectInput(BaseModel):
     build_command: Optional[str] = Field(default=None, description="Build command, e.g. 'npm run build'")
     destination_dir: Optional[str] = Field(default=None, description="Build output directory, e.g. 'dist' or 'build'")
     root_dir: Optional[str] = Field(default=None, description="Repo subdirectory to build from (monorepos)")
-    account: Optional[str] = Field(default=None, description="Account name or ID")
 
 
-class DeletePagesProjectInput(BaseModel):
+class DeletePagesProjectInput(_CFBase):
     """Input for deleting a Pages project."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
     project_name: str = Field(..., description="Pages project name", min_length=1)
-    account: Optional[str] = Field(default=None, description="Account name or ID")
 
 
-class ListPagesDeploymentsInput(BaseModel):
+class ListPagesDeploymentsInput(_CFBase):
     """Input for listing a Pages project's deployments."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
     project_name: str = Field(..., description="Pages project name", min_length=1)
-    account: Optional[str] = Field(default=None, description="Account name or ID")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
 
 
-class CreatePagesDeploymentInput(BaseModel):
+class CreatePagesDeploymentInput(_CFBase):
     """Input for triggering a new Pages deployment (git-connected projects)."""
     model_config = ConfigDict(str_strip_whitespace=True)
 
     project_name: str = Field(..., description="Pages project name", min_length=1)
     branch: Optional[str] = Field(default=None, description="Branch to deploy (defaults to the production branch)")
-    account: Optional[str] = Field(default=None, description="Account name or ID")
 
 
 # Shared utilities
@@ -467,7 +523,21 @@ def _get_api_token() -> str:
     Raises:
         ValueError: If API token cannot be retrieved.
     """
-    # Try OpenBao first if agent is available
+    # Multi-account: resolve from the per-call `account` selector + accounts file.
+    accounts = _load_cf_accounts()
+    if accounts:
+        label = _current_account.get() or CF_DEFAULT_ACCOUNT
+        token = accounts.get(label)
+        if token:
+            return token
+        if _current_account.get():
+            raise ValueError(
+                f"Unknown Cloudflare account '{label}'. Configured: {', '.join(sorted(accounts))}. "
+                f"Add it to {CF_ACCOUNTS_FILE}."
+            )
+        # default account not in the file -> fall through to OpenBao/env
+
+    # OpenBao agent (single-account / back-compat)
     if _is_openbao_agent_available():
         try:
             secret_path = _build_cloudflare_secret_path()
@@ -486,9 +556,9 @@ def _get_api_token() -> str:
 
     raise ValueError(
         "Cloudflare API token not found.\n"
-        "Set CLOUDFLARE_API_TOKEN environment variable.\n\n"
+        f"Configure {CF_ACCOUNTS_FILE} (multi-account) or set CLOUDFLARE_API_TOKEN.\n\n"
         "Create API token at: https://dash.cloudflare.com/profile/api-tokens\n"
-        "Required permissions: Zone:Read and DNS:Edit"
+        "Required permissions: Zone:Read, DNS:Edit, Dynamic Redirect:Edit, Cloudflare Pages:Edit"
     )
 
 
@@ -1201,7 +1271,7 @@ def _format_pages_deployment_markdown(d: dict) -> str:
 async def cloudflare_list_pages_projects(params: ListPagesProjectsInput) -> str:
     """List Cloudflare Pages projects in the account."""
     try:
-        account_id = await _resolve_account_id(params.account)
+        account_id = await _resolve_account_id()
         data = await _make_request("GET", f"accounts/{account_id}/pages/projects")
         projects = data.get("result", []) or []
         if params.response_format == ResponseFormat.JSON:
@@ -1224,7 +1294,7 @@ async def cloudflare_list_pages_projects(params: ListPagesProjectsInput) -> str:
 async def cloudflare_get_pages_project(params: GetPagesProjectInput) -> str:
     """Get one Cloudflare Pages project's details (source, build config, domains, latest deploy)."""
     try:
-        account_id = await _resolve_account_id(params.account)
+        account_id = await _resolve_account_id()
         data = await _make_request("GET", f"accounts/{account_id}/pages/projects/{params.project_name}")
         p = data.get("result", {}) or {}
         if params.response_format == ResponseFormat.JSON:
@@ -1248,7 +1318,7 @@ async def cloudflare_create_pages_project(params: CreatePagesProjectInput) -> st
     with a connection error. Without github_*, a direct-upload project is created.
     """
     try:
-        account_id = await _resolve_account_id(params.account)
+        account_id = await _resolve_account_id()
         body: dict = {"name": params.name, "production_branch": params.production_branch}
         if params.github_owner and params.github_repo:
             body["source"] = {
@@ -1285,7 +1355,7 @@ async def cloudflare_create_pages_project(params: CreatePagesProjectInput) -> st
 async def cloudflare_delete_pages_project(params: DeletePagesProjectInput) -> str:
     """Delete a Cloudflare Pages project. This cannot be undone."""
     try:
-        account_id = await _resolve_account_id(params.account)
+        account_id = await _resolve_account_id()
         data = await _make_request("DELETE", f"accounts/{account_id}/pages/projects/{params.project_name}")
         if data.get("success"):
             return f"Pages project `{params.project_name}` deleted."
@@ -1301,7 +1371,7 @@ async def cloudflare_delete_pages_project(params: DeletePagesProjectInput) -> st
 async def cloudflare_list_pages_deployments(params: ListPagesDeploymentsInput) -> str:
     """List a Pages project's deployments (newest first), with status + branch/commit."""
     try:
-        account_id = await _resolve_account_id(params.account)
+        account_id = await _resolve_account_id()
         data = await _make_request("GET", f"accounts/{account_id}/pages/projects/{params.project_name}/deployments")
         deployments = data.get("result", []) or []
         if params.response_format == ResponseFormat.JSON:
@@ -1328,7 +1398,7 @@ async def cloudflare_create_pages_deployment(params: CreatePagesDeploymentInput)
     Pages dashboard (git connection). Useful to re-deploy/rollback after a push.
     """
     try:
-        account_id = await _resolve_account_id(params.account)
+        account_id = await _resolve_account_id()
         body = {"branch": params.branch} if params.branch else None
         data = await _make_request(
             "POST", f"accounts/{account_id}/pages/projects/{params.project_name}/deployments", json_data=body
