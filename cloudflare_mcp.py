@@ -295,6 +295,90 @@ class DeleteDNSRecordInput(BaseModel):
     record_id: str = Field(..., description="DNS record ID to delete", min_length=1)
 
 
+# Redirect Rules (Single Redirects — http_request_dynamic_redirect phase)
+_REDIRECT_STATUS_CODES = (301, 302, 303, 307, 308)
+
+
+class ListRedirectRulesInput(BaseModel):
+    """Input for listing a zone's redirect (Single Redirect) rules."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    zone: str = Field(..., description="Zone name (e.g. 'cbrc.events') or zone ID", min_length=1)
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN, description="Output format"
+    )
+
+
+class CreateRedirectRuleInput(BaseModel):
+    """Input for creating a redirect (Single Redirect) rule."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    zone: str = Field(..., description="Zone name or zone ID", min_length=1)
+    target_url: str = Field(
+        ..., description="Destination URL, e.g. 'https://cbrcevents.net'", min_length=1
+    )
+    status_code: int = Field(default=301, description="Redirect status (301/302/303/307/308)")
+    preserve_query_string: bool = Field(
+        default=True, description="Keep the incoming query string on the redirect"
+    )
+    preserve_path: bool = Field(
+        default=True,
+        description="Append the incoming path to target_url (dynamic redirect via concat). "
+                    "False = static redirect to target_url verbatim."
+    )
+    match_expression: Optional[str] = Field(
+        default=None,
+        description="Cloudflare Rules expression for what to match, e.g. '(http.host eq \"cbrc.events\")'. "
+                    "If omitted and source_hostname is given, it's built for you."
+    )
+    source_hostname: Optional[str] = Field(
+        default=None,
+        description="Convenience: hostname to match (builds '(http.host eq \"<hostname>\")') when "
+                    "match_expression is omitted.",
+        max_length=253
+    )
+    description: Optional[str] = Field(default=None, description="Rule description", max_length=500)
+    enabled: bool = Field(default=True, description="Whether the rule is active")
+
+    @field_validator('status_code')
+    @classmethod
+    def validate_status(cls, v: int) -> int:
+        if v not in _REDIRECT_STATUS_CODES:
+            raise ValueError(f"status_code must be one of {_REDIRECT_STATUS_CODES}")
+        return v
+
+
+class UpdateRedirectRuleInput(BaseModel):
+    """Input for updating a redirect rule by id (only provided fields change)."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    zone: str = Field(..., description="Zone name or zone ID", min_length=1)
+    rule_id: str = Field(..., description="Redirect rule ID (from cloudflare_list_redirect_rules)", min_length=1)
+    target_url: Optional[str] = Field(default=None, description="New destination URL")
+    status_code: Optional[int] = Field(default=None, description="New status (301/302/303/307/308)")
+    preserve_query_string: Optional[bool] = Field(default=None, description="Keep query string")
+    preserve_path: Optional[bool] = Field(default=None, description="Append incoming path to target")
+    match_expression: Optional[str] = Field(default=None, description="New match expression")
+    source_hostname: Optional[str] = Field(default=None, description="New source hostname to match", max_length=253)
+    description: Optional[str] = Field(default=None, description="New description", max_length=500)
+    enabled: Optional[bool] = Field(default=None, description="Enable/disable the rule")
+
+    @field_validator('status_code')
+    @classmethod
+    def validate_status(cls, v):
+        if v is not None and v not in _REDIRECT_STATUS_CODES:
+            raise ValueError(f"status_code must be one of {_REDIRECT_STATUS_CODES}")
+        return v
+
+
+class DeleteRedirectRuleInput(BaseModel):
+    """Input for deleting a redirect rule by id."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    zone: str = Field(..., description="Zone name or zone ID", min_length=1)
+    rule_id: str = Field(..., description="Redirect rule ID to delete", min_length=1)
+
+
 # Shared utilities
 def _is_openbao_agent_available() -> bool:
     """Check if OpenBao agent is reachable."""
@@ -770,6 +854,216 @@ async def cloudflare_delete_dns_record(params: DeleteDNSRecordInput) -> str:
         else:
             return f"Failed to delete DNS record. Response: {json.dumps(data)}"
 
+    except Exception as e:
+        return _handle_error(e)
+
+
+# =============================================================================
+# Redirect Rules (Single Redirects)
+# =============================================================================
+
+_REDIRECT_PHASE = "http_request_dynamic_redirect"
+_REDIRECT_ENTRYPOINT = "zones/{zid}/rulesets/phases/" + _REDIRECT_PHASE + "/entrypoint"
+
+
+async def _get_redirect_entrypoint(zone_id: str):
+    """Return (ruleset_id, rules[]) for the zone's dynamic-redirect entrypoint.
+
+    Cloudflare returns 404 if no redirect rule has ever existed on the zone —
+    we treat that as 'empty, none yet' rather than an error.
+    """
+    try:
+        data = await _make_request("GET", _REDIRECT_ENTRYPOINT.format(zid=zone_id))
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return None, []
+        raise
+    rs = data.get("result", {}) or {}
+    return rs.get("id"), (rs.get("rules") or [])
+
+
+async def _put_redirect_rules(zone_id: str, rules: list) -> list:
+    """Replace the dynamic-redirect entrypoint's rules array (create-or-replace)."""
+    data = await _make_request(
+        "PUT", _REDIRECT_ENTRYPOINT.format(zid=zone_id), json_data={"rules": rules}
+    )
+    rs = data.get("result", {}) or {}
+    return rs.get("rules") or []
+
+
+def _build_from_value(target_url: str, status_code: int, preserve_query_string: bool, preserve_path: bool) -> dict:
+    """Build action_parameters.from_value for a redirect rule."""
+    fv = {"status_code": status_code, "preserve_query_string": preserve_query_string}
+    if preserve_path:
+        # Dynamic redirect: append the incoming path to the target.
+        safe_target = target_url.replace('"', '\\"')
+        fv["target_url"] = {"expression": f'concat("{safe_target}", http.request.uri.path)'}
+    else:
+        fv["target_url"] = {"value": target_url}
+    return fv
+
+
+def _format_redirect_rule_markdown(rule: dict) -> str:
+    ap = (rule.get("action_parameters") or {})
+    fv = (ap.get("from_value") or {})
+    tu = fv.get("target_url") or {}
+    target = tu.get("value") or tu.get("expression") or "?"
+    lines = [
+        f"### Redirect rule `{rule.get('id', '(new)')}`",
+        f"- **Match**: `{rule.get('expression', '')}`",
+        f"- **Target**: `{target}`",
+        f"- **Status**: {fv.get('status_code', '?')}",
+        f"- **Preserve query string**: {'Yes' if fv.get('preserve_query_string') else 'No'}",
+        f"- **Enabled**: {'Yes' if rule.get('enabled', True) else 'No'}",
+    ]
+    if rule.get("description"):
+        lines.append(f"- **Description**: {rule['description']}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="cloudflare_list_redirect_rules",
+    annotations={"title": "List Redirect Rules", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_list_redirect_rules(params: ListRedirectRulesInput) -> str:
+    """List a zone's Single Redirect rules (dynamic-redirect ruleset).
+
+    Returns each rule's id, match expression, target, status code, and enabled
+    state. Empty before any redirect has been created on the zone.
+    """
+    try:
+        zone_id = await _resolve_zone_id(params.zone)
+        ruleset_id, rules = await _get_redirect_entrypoint(zone_id)
+
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({"zone": params.zone, "zone_id": zone_id, "ruleset_id": ruleset_id, "rules": rules}, indent=2)
+
+        if not rules:
+            return f"No redirect rules on zone '{params.zone}' yet."
+        lines = [f"# Redirect Rules for {params.zone}", "", f"Ruleset ID: `{ruleset_id}` · {len(rules)} rule(s)", ""]
+        for rule in rules:
+            lines.append(_format_redirect_rule_markdown(rule))
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_create_redirect_rule",
+    annotations={"title": "Create Redirect Rule", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
+)
+async def cloudflare_create_redirect_rule(params: CreateRedirectRuleInput) -> str:
+    """Create a Single Redirect (e.g. cbrc.events -> https://cbrcevents.net, 301).
+
+    Reads the zone's dynamic-redirect entrypoint, appends the new rule, and PUTs
+    the full rules array back (creates the ruleset if it didn't exist).
+
+    Requires the API token to have Zone -> Dynamic Redirect -> Edit.
+    """
+    try:
+        match = params.match_expression
+        if not match and params.source_hostname:
+            match = f'(http.host eq "{params.source_hostname}")'
+        if not match:
+            return "Error: provide match_expression or source_hostname so the rule knows what to match."
+
+        zone_id = await _resolve_zone_id(params.zone)
+        _, rules = await _get_redirect_entrypoint(zone_id)
+
+        new_rule = {
+            "action": "redirect",
+            "action_parameters": {
+                "from_value": _build_from_value(
+                    params.target_url, params.status_code, params.preserve_query_string, params.preserve_path
+                )
+            },
+            "expression": match,
+            "enabled": params.enabled,
+        }
+        if params.description:
+            new_rule["description"] = params.description
+
+        rules = list(rules) + [new_rule]
+        updated = await _put_redirect_rules(zone_id, rules)
+        created = updated[-1] if updated else new_rule
+        return f"Redirect rule created on '{params.zone}':\n\n{_format_redirect_rule_markdown(created)}"
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_update_redirect_rule",
+    annotations={"title": "Update Redirect Rule", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_update_redirect_rule(params: UpdateRedirectRuleInput) -> str:
+    """Update a redirect rule by id (only the fields you pass change).
+
+    Read-modify-write on the dynamic-redirect entrypoint.
+    """
+    try:
+        zone_id = await _resolve_zone_id(params.zone)
+        _, rules = await _get_redirect_entrypoint(zone_id)
+        rules = list(rules)
+
+        idx = next((i for i, r in enumerate(rules) if r.get("id") == params.rule_id), None)
+        if idx is None:
+            return f"Error: redirect rule `{params.rule_id}` not found on zone '{params.zone}'."
+
+        rule = dict(rules[idx])
+        # Match expression
+        if params.match_expression is not None:
+            rule["expression"] = params.match_expression
+        elif params.source_hostname is not None:
+            rule["expression"] = f'(http.host eq "{params.source_hostname}")'
+        # Enabled / description
+        if params.enabled is not None:
+            rule["enabled"] = params.enabled
+        if params.description is not None:
+            rule["description"] = params.description
+        # from_value (rebuild if any of its components changed)
+        cur_fv = ((rule.get("action_parameters") or {}).get("from_value") or {})
+        cur_tu = cur_fv.get("target_url") or {}
+        cur_is_dynamic = "expression" in cur_tu
+        if any(v is not None for v in (params.target_url, params.status_code, params.preserve_query_string, params.preserve_path)):
+            # Derive current target if target_url not supplied
+            if params.target_url is not None:
+                target = params.target_url
+            elif cur_is_dynamic:
+                # strip concat("...", http.request.uri.path) back to the literal
+                expr = cur_tu.get("expression", "")
+                target = expr.split('"')[1] if '"' in expr else expr
+            else:
+                target = cur_tu.get("value", "")
+            status = params.status_code if params.status_code is not None else cur_fv.get("status_code", 301)
+            pqs = params.preserve_query_string if params.preserve_query_string is not None else bool(cur_fv.get("preserve_query_string", True))
+            ppath = params.preserve_path if params.preserve_path is not None else cur_is_dynamic
+            rule["action"] = "redirect"
+            rule["action_parameters"] = {"from_value": _build_from_value(target, status, pqs, ppath)}
+
+        rules[idx] = rule
+        updated = await _put_redirect_rules(zone_id, rules)
+        out = next((r for r in updated if r.get("id") == params.rule_id), rule)
+        return f"Redirect rule updated on '{params.zone}':\n\n{_format_redirect_rule_markdown(out)}"
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_delete_redirect_rule",
+    annotations={"title": "Delete Redirect Rule", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_delete_redirect_rule(params: DeleteRedirectRuleInput) -> str:
+    """Delete a redirect rule by id (read-modify-write on the entrypoint)."""
+    try:
+        zone_id = await _resolve_zone_id(params.zone)
+        _, rules = await _get_redirect_entrypoint(zone_id)
+        rules = list(rules)
+        remaining = [r for r in rules if r.get("id") != params.rule_id]
+        if len(remaining) == len(rules):
+            return f"Error: redirect rule `{params.rule_id}` not found on zone '{params.zone}'."
+        await _put_redirect_rules(zone_id, remaining)
+        return f"Redirect rule `{params.rule_id}` deleted from zone '{params.zone}'. {len(remaining)} rule(s) remain."
     except Exception as e:
         return _handle_error(e)
 
