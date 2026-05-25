@@ -539,6 +539,47 @@ class UpdateDomainInput(_CFBase):
     privacy: Optional[bool] = Field(default=None, description="WHOIS privacy (redaction) on/off.")
 
 
+# Generic passthrough + whoami
+class CloudflareRequestInput(_CFBase):
+    """Input for the generic Cloudflare API passthrough."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    method: str = Field(..., description="HTTP method: GET, POST, PUT, PATCH, or DELETE")
+    path: str = Field(
+        ...,
+        description=(
+            "API path after https://api.cloudflare.com/client/v4/ (no leading slash needed), "
+            "e.g. 'zones/<zone_id>/purge_cache' or 'accounts/{account_id}/workers/scripts'. "
+            "A literal '{account_id}' in the path is auto-substituted from the active account."
+        ),
+        min_length=1,
+    )
+    params: Optional[dict] = Field(default=None, description="Query parameters as a JSON object.")
+    body: Optional[dict] = Field(default=None, description="Request body as a JSON object (POST/PUT/PATCH).")
+
+    @field_validator("params", "body", mode="before")
+    @classmethod
+    def _coerce_obj(cls, v):
+        if v is None or isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            p = json.loads(s)
+            if not isinstance(p, dict):
+                raise ValueError("expected a JSON object")
+            return p
+        raise ValueError("expected a JSON object")
+
+
+class WhoamiInput(_CFBase):
+    """Input for whoami / token + account verification."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
+
+
 # Shared utilities
 def _is_openbao_agent_available() -> bool:
     """Check if OpenBao agent is reachable."""
@@ -1591,6 +1632,93 @@ async def cloudflare_update_domain(params: UpdateDomainInput) -> str:
         d = data.get("result", {}) or {}
         detail = _format_domain_markdown(d) if d else f"Applied: {json.dumps(body)}"
         return f"Domain '{params.domain_name}' updated:\n\n{detail}"
+    except Exception as e:
+        return _handle_error(e)
+
+
+# =============================================================================
+# Generic passthrough + whoami
+# =============================================================================
+
+
+@mcp.tool(
+    name="cloudflare_request",
+    annotations={"title": "Cloudflare API Passthrough", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
+)
+async def cloudflare_request(params: CloudflareRequestInput) -> str:
+    """Generic Cloudflare API passthrough — call ANY endpoint not covered by a
+    dedicated tool (cache purge, zone settings, Workers, WAF, custom hostnames,
+    analytics, etc.).
+
+    `path` is everything after https://api.cloudflare.com/client/v4/ . A literal
+    '{account_id}' in the path is auto-substituted from the active account.
+
+    Examples:
+      method=POST path='zones/<zone_id>/purge_cache' body={"purge_everything": true}
+      method=GET  path='accounts/{account_id}/workers/scripts'
+      method=PATCH path='zones/<zone_id>/settings/always_use_https' body={"value": "on"}
+
+    Returns the raw JSON response. Multi-account aware via the `account` selector.
+    """
+    try:
+        path = params.path.lstrip("/")
+        if "{account_id}" in path:
+            account_id = await _resolve_account_id()
+            path = path.replace("{account_id}", account_id)
+        data = await _make_request(params.method.upper(), path, params=params.params, json_data=params.body)
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_whoami",
+    annotations={"title": "Cloudflare Whoami", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_whoami(params: WhoamiInput) -> str:
+    """Show the active account selector, the configured accounts, the token's
+    verification status, and which Cloudflare accounts this token can see.
+
+    Handy for debugging multi-account routing (e.g. confirming account=ets
+    actually swapped tokens, or that a token's IP filter / scopes are the issue).
+    """
+    try:
+        active = _current_account.get() or CF_DEFAULT_ACCOUNT
+        configured = sorted(_load_cf_accounts().keys())
+        try:
+            v = await _make_request("GET", "user/tokens/verify")
+            token_status = (v.get("result") or {}).get("status", "unknown")
+        except Exception:
+            token_status = "unverifiable (token may lack user scope)"
+        try:
+            a = await _make_request("GET", "accounts")
+            accounts = a.get("result", []) or []
+        except Exception:
+            accounts = []
+
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({
+                "active_account": active,
+                "configured_accounts": configured,
+                "token_status": token_status,
+                "accessible_accounts": accounts,
+            }, indent=2)
+
+        lines = [
+            "# Cloudflare whoami",
+            "",
+            f"- **Active account selector**: `{active}`",
+            f"- **Configured accounts**: {', '.join(configured) or '(none — using env/OpenBao)'}",
+            f"- **Token status**: {token_status}",
+            "",
+        ]
+        if accounts:
+            lines.append(f"**Accessible accounts ({len(accounts)})**:")
+            for a in accounts:
+                lines.append(f"- {a.get('name', '?')} (`{a.get('id')}`)")
+        else:
+            lines.append("No accounts visible to this token (or the token lacks account-list permission).")
+        return "\n".join(lines)
     except Exception as e:
         return _handle_error(e)
 
