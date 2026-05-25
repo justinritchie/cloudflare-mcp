@@ -379,6 +379,69 @@ class DeleteRedirectRuleInput(BaseModel):
     rule_id: str = Field(..., description="Redirect rule ID to delete", min_length=1)
 
 
+# Cloudflare Pages (account-scoped — needs Account -> Cloudflare Pages -> Edit)
+class ListPagesProjectsInput(BaseModel):
+    """Input for listing Pages projects."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    account: Optional[str] = Field(
+        default=None, description="Account name or ID (optional if the token sees exactly one account)"
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
+
+
+class GetPagesProjectInput(BaseModel):
+    """Input for getting one Pages project."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    project_name: str = Field(..., description="Pages project name", min_length=1)
+    account: Optional[str] = Field(default=None, description="Account name or ID")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
+
+
+class CreatePagesProjectInput(BaseModel):
+    """Input for creating a Pages project (direct-upload, or git-connected to GitHub)."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(..., description="Project name (becomes the <name>.pages.dev subdomain)", min_length=1, max_length=58)
+    production_branch: str = Field(default="main", description="Production branch")
+    github_owner: Optional[str] = Field(
+        default=None,
+        description="GitHub owner/org for a git-connected project. Requires the 'Cloudflare Workers and Pages' GitHub App to already be authorized for this account in the dashboard (one-time)."
+    )
+    github_repo: Optional[str] = Field(default=None, description="GitHub repository name (with github_owner)")
+    build_command: Optional[str] = Field(default=None, description="Build command, e.g. 'npm run build'")
+    destination_dir: Optional[str] = Field(default=None, description="Build output directory, e.g. 'dist' or 'build'")
+    root_dir: Optional[str] = Field(default=None, description="Repo subdirectory to build from (monorepos)")
+    account: Optional[str] = Field(default=None, description="Account name or ID")
+
+
+class DeletePagesProjectInput(BaseModel):
+    """Input for deleting a Pages project."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    project_name: str = Field(..., description="Pages project name", min_length=1)
+    account: Optional[str] = Field(default=None, description="Account name or ID")
+
+
+class ListPagesDeploymentsInput(BaseModel):
+    """Input for listing a Pages project's deployments."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    project_name: str = Field(..., description="Pages project name", min_length=1)
+    account: Optional[str] = Field(default=None, description="Account name or ID")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
+
+
+class CreatePagesDeploymentInput(BaseModel):
+    """Input for triggering a new Pages deployment (git-connected projects)."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    project_name: str = Field(..., description="Pages project name", min_length=1)
+    branch: Optional[str] = Field(default=None, description="Branch to deploy (defaults to the production branch)")
+    account: Optional[str] = Field(default=None, description="Account name or ID")
+
+
 # Shared utilities
 def _is_openbao_agent_available() -> bool:
     """Check if OpenBao agent is reachable."""
@@ -1064,6 +1127,214 @@ async def cloudflare_delete_redirect_rule(params: DeleteRedirectRuleInput) -> st
             return f"Error: redirect rule `{params.rule_id}` not found on zone '{params.zone}'."
         await _put_redirect_rules(zone_id, remaining)
         return f"Redirect rule `{params.rule_id}` deleted from zone '{params.zone}'. {len(remaining)} rule(s) remain."
+    except Exception as e:
+        return _handle_error(e)
+
+
+# =============================================================================
+# Cloudflare Pages
+# =============================================================================
+
+
+async def _resolve_account_id(account: Optional[str] = None) -> str:
+    """Resolve an account name or ID to an account ID.
+
+    If `account` looks like an ID (32 hex), return it. Otherwise GET /accounts
+    and match by name/id, or auto-pick when the token sees exactly one account.
+    """
+    if account and len(account) == 32 and all(c in "0123456789abcdef" for c in account.lower()):
+        return account
+    data = await _make_request("GET", "accounts")
+    accounts = data.get("result", []) or []
+    if account:
+        for a in accounts:
+            if a.get("id") == account or a.get("name", "").lower() == account.lower():
+                return a["id"]
+        raise ValueError(f"Cloudflare account '{account}' not found with this token.")
+    if not accounts:
+        raise ValueError("No Cloudflare accounts accessible — the token needs Account-level access (e.g. Cloudflare Pages: Edit).")
+    if len(accounts) > 1:
+        names = ", ".join(f"{a.get('name','?')} ({a.get('id')})" for a in accounts)
+        raise ValueError(f"Multiple accounts accessible: {names}. Pass account=<name or id>.")
+    return accounts[0]["id"]
+
+
+def _format_pages_project_markdown(p: dict) -> str:
+    src = p.get("source") or {}
+    cfg = src.get("config") or {}
+    bc = p.get("build_config") or {}
+    latest = p.get("latest_deployment") or {}
+    lines = [
+        f"### {p.get('name')}",
+        f"- **Subdomain**: `{p.get('subdomain', '')}`",
+        f"- **Production branch**: {p.get('production_branch', '')}",
+    ]
+    if src.get("type"):
+        lines.append(f"- **Source**: {src.get('type')} → `{cfg.get('owner', '?')}/{cfg.get('repo_name', '?')}`")
+    if bc.get("build_command"):
+        lines.append(f"- **Build**: `{bc.get('build_command')}` → `{bc.get('destination_dir', '')}`")
+    domains = p.get("domains") or []
+    if domains:
+        lines.append(f"- **Domains**: {', '.join(domains)}")
+    if latest:
+        stage = (latest.get("latest_stage") or {})
+        lines.append(f"- **Latest deploy**: {latest.get('url', '')} ({stage.get('name', '?')}/{stage.get('status', '?')})")
+    return "\n".join(lines)
+
+
+def _format_pages_deployment_markdown(d: dict) -> str:
+    stage = (d.get("latest_stage") or {})
+    dt = (d.get("deployment_trigger") or {}).get("metadata") or {}
+    return "\n".join([
+        f"### {d.get('id', '')[:8]} — {d.get('environment', '')}",
+        f"- **URL**: {d.get('url', '')}",
+        f"- **Status**: {stage.get('name', '?')}/{stage.get('status', '?')}",
+        f"- **Branch**: {dt.get('branch', '?')} · commit `{(dt.get('commit_hash') or '')[:8]}`",
+        f"- **Created**: {d.get('created_on', '')}",
+    ])
+
+
+@mcp.tool(
+    name="cloudflare_list_pages_projects",
+    annotations={"title": "List Pages Projects", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_list_pages_projects(params: ListPagesProjectsInput) -> str:
+    """List Cloudflare Pages projects in the account."""
+    try:
+        account_id = await _resolve_account_id(params.account)
+        data = await _make_request("GET", f"accounts/{account_id}/pages/projects")
+        projects = data.get("result", []) or []
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({"account_id": account_id, "projects": projects}, indent=2)
+        if not projects:
+            return "No Pages projects in this account."
+        lines = ["# Cloudflare Pages Projects", "", f"{len(projects)} project(s)", ""]
+        for p in projects:
+            lines.append(_format_pages_project_markdown(p))
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_get_pages_project",
+    annotations={"title": "Get Pages Project", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_get_pages_project(params: GetPagesProjectInput) -> str:
+    """Get one Cloudflare Pages project's details (source, build config, domains, latest deploy)."""
+    try:
+        account_id = await _resolve_account_id(params.account)
+        data = await _make_request("GET", f"accounts/{account_id}/pages/projects/{params.project_name}")
+        p = data.get("result", {}) or {}
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(p, indent=2)
+        return _format_pages_project_markdown(p)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_create_pages_project",
+    annotations={"title": "Create Pages Project", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
+)
+async def cloudflare_create_pages_project(params: CreatePagesProjectInput) -> str:
+    """Create a Cloudflare Pages project — optionally git-connected to a GitHub repo.
+
+    For a GitHub-connected project pass github_owner + github_repo (and optionally
+    build_command/destination_dir/root_dir). NOTE: the 'Cloudflare Workers and
+    Pages' GitHub App must already be authorized for this account in the
+    dashboard (a one-time step the API can't perform); otherwise creation fails
+    with a connection error. Without github_*, a direct-upload project is created.
+    """
+    try:
+        account_id = await _resolve_account_id(params.account)
+        body: dict = {"name": params.name, "production_branch": params.production_branch}
+        if params.github_owner and params.github_repo:
+            body["source"] = {
+                "type": "github",
+                "config": {
+                    "owner": params.github_owner,
+                    "repo_name": params.github_repo,
+                    "production_branch": params.production_branch,
+                    "production_deployments_enabled": True,
+                    "deployments_enabled": True,
+                },
+            }
+        bc = {}
+        if params.build_command:
+            bc["build_command"] = params.build_command
+        if params.destination_dir:
+            bc["destination_dir"] = params.destination_dir
+        if params.root_dir:
+            bc["root_dir"] = params.root_dir
+        if bc:
+            body["build_config"] = bc
+
+        data = await _make_request("POST", f"accounts/{account_id}/pages/projects", json_data=body)
+        p = data.get("result", {}) or {}
+        return f"Pages project created:\n\n{_format_pages_project_markdown(p)}"
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_delete_pages_project",
+    annotations={"title": "Delete Pages Project", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_delete_pages_project(params: DeletePagesProjectInput) -> str:
+    """Delete a Cloudflare Pages project. This cannot be undone."""
+    try:
+        account_id = await _resolve_account_id(params.account)
+        data = await _make_request("DELETE", f"accounts/{account_id}/pages/projects/{params.project_name}")
+        if data.get("success"):
+            return f"Pages project `{params.project_name}` deleted."
+        return f"Failed to delete project. Response: {json.dumps(data)}"
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_list_pages_deployments",
+    annotations={"title": "List Pages Deployments", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+)
+async def cloudflare_list_pages_deployments(params: ListPagesDeploymentsInput) -> str:
+    """List a Pages project's deployments (newest first), with status + branch/commit."""
+    try:
+        account_id = await _resolve_account_id(params.account)
+        data = await _make_request("GET", f"accounts/{account_id}/pages/projects/{params.project_name}/deployments")
+        deployments = data.get("result", []) or []
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({"project": params.project_name, "deployments": deployments}, indent=2)
+        if not deployments:
+            return f"No deployments for Pages project '{params.project_name}'."
+        lines = [f"# Deployments — {params.project_name}", "", f"{len(deployments)} deployment(s)", ""]
+        for d in deployments[:25]:
+            lines.append(_format_pages_deployment_markdown(d))
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="cloudflare_create_pages_deployment",
+    annotations={"title": "Create Pages Deployment", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
+)
+async def cloudflare_create_pages_deployment(params: CreatePagesDeploymentInput) -> str:
+    """Trigger a new deployment for a git-connected Pages project (defaults to production).
+
+    The project's repo + account must already be authorized on the Cloudflare
+    Pages dashboard (git connection). Useful to re-deploy/rollback after a push.
+    """
+    try:
+        account_id = await _resolve_account_id(params.account)
+        body = {"branch": params.branch} if params.branch else None
+        data = await _make_request(
+            "POST", f"accounts/{account_id}/pages/projects/{params.project_name}/deployments", json_data=body
+        )
+        d = data.get("result", {}) or {}
+        return f"Deployment triggered for '{params.project_name}':\n\n{_format_pages_deployment_markdown(d)}"
     except Exception as e:
         return _handle_error(e)
 
